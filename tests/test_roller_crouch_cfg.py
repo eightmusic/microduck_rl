@@ -46,3 +46,13 @@ def test_entry_velocity_applied_safely_via_reset_base():
     assert vr and "x" in vr
     lo, hi = vr["x"]
     assert lo > 0.0 and hi >= lo
+
+
+def test_bam_friction_fields_are_expanded_per_world():
+    # Regression: BAM writes per-env dof_frictionloss/dof_damping every step;
+    # without the startup expansion event the env crashes at reset (the same
+    # latent bug as the spin task, fixed 2026-10-08).
+    cfg = make_microduck_roller_crouch_env_cfg()
+    term = cfg.events["expand_bam_friction_fields"]
+    assert term.mode == "startup"
+    assert term.func is microduck_mdp.expand_bam_friction_fields

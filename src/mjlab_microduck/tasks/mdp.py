@@ -145,6 +145,43 @@ try:
 except Exception as _e:  # pragma: no cover
     print(f"[mdp] Patch 5 NOT applied ({_e!r})")
 
+# Patch 6: graceful critic fallback when a checkpoint's CRITIC obs no longer
+# matches the env (the jump family added a critic-only height obs 2026-10-09;
+# the trained frog checkpoints predate it — critic input dim 61+N ≠ N+3).
+# rsl_rl's full load (actor+critic+optimizer) would crash on the shape
+# mismatch. The ACTOR obs contract is what deployment uses and it is NOT
+# allowed to drift — so: if the actor state dict is compatible, load it and
+# continue with a FRESH critic + optimizer (the value function re-learns in
+# hundreds of iterations; the policy keeps its skill). If the ACTOR itself
+# mismatches, that is a real contract break and the load must fail loudly.
+try:
+    from rsl_rl.algorithms.ppo import PPO as _PPOAlg  # noqa: E402
+
+    _orig_alg_load = _PPOAlg.load
+
+    def _alg_load_critic_fallback(self, loaded_dict, load_cfg, strict):
+        try:
+            return _orig_alg_load(self, loaded_dict, load_cfg, strict)
+        except RuntimeError as _e:
+            if "size mismatch" not in str(_e):
+                raise
+            _orig_alg_load(
+                self,
+                {**loaded_dict, "critic_state_dict": {}, "optimizer_state_dict": {}},
+                {"actor": True, "critic": False, "optimizer": False, "iteration": False, "rnd": False},
+                strict,
+            )
+            print(
+                "[mdp] Patch 6: checkpoint CRITIC obs mismatch — loaded ACTOR only, "
+                "critic + optimizer re-initialized (actor obs contract unchanged)"
+            )
+            return False
+
+    _PPOAlg.load = _alg_load_critic_fallback
+    print("[mdp] Patch 6 active: critic obs mismatch loads actor-only instead of crashing")
+except Exception as _e:  # pragma: no cover
+    print(f"[mdp] Patch 6 NOT applied ({_e!r})")
+
 if TYPE_CHECKING:
     from mjlab.viewer.debug_visualizer import DebugVisualizer
 
@@ -4708,6 +4745,37 @@ def face_down_prob_curriculum(
 class VelocityCommandCommandOnly(UniformVelocityCommand):
     """Like UniformVelocityCommand but only draws the command arrows (no actual velocity arrows)."""
 
+    def create_gui(
+        self,
+        name: str,
+        server,
+        get_env_idx,
+        on_change=None,
+        request_action=None,
+    ) -> None:
+        """Skip the joystick GUI for tiny command ranges.
+
+        mjlab's velocity GUI builds a "Max <axis>" slider hard-coding
+        min=0.1/step=0.1 and seeds it with each axis's command-range bound —
+        any axis bounded below 0.1 (the ±0.01 parity slots of the episodic
+        trick family) dies on viser's ``assert max >= value >= min`` and the
+        whole viewer crashes at startup. Those tasks are constant-command
+        tricks, so the interactive joystick has nothing meaningful to drive
+        anyway; the sampled command stays exactly as trained. Tasks with real
+        command ranges (walking) keep the full GUI.
+        """
+        r = self.cfg.ranges
+        smallest_bound = min(
+            abs(r.lin_vel_x[1] if r.lin_vel_x else 0.0),
+            abs(r.lin_vel_y[1] if r.lin_vel_y else 0.0),
+            abs(r.ang_vel_z[1] if r.ang_vel_z else 0.0),
+        )
+        if smallest_bound < 0.1:
+            return
+        return super().create_gui(
+            name, server, get_env_idx, on_change, request_action
+        )
+
     def _resample_command(self, env_ids: torch.Tensor) -> None:
         super()._resample_command(env_ids)
         # Turn-in-place practice: for a fraction of envs, zero the linear velocity
@@ -7669,3 +7737,823 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# ==============================================================================
+# Jump family (THREE tasks) — shared state machine
+# ==============================================================================
+#
+# The family serves three tasks off ONE robot/obs/DR/latch recipe and ONE
+# per-env state machine (microduck_jump_env_cfg.py builds the cfgs):
+#   • Mjlab-JumpHigh-Flat-MicroDuck — one VERTICAL jump, as high as possible;
+#     the discriminator is jump_height_bonus (per-flight apex rise).
+#   • Mjlab-LongJump-Flat-MicroDuck — ONE forward long jump, then stand
+#     (single mode); the discriminator is jump_distance_bonus.
+#   • Mjlab-FrogJump-Flat-MicroDuck — continuous forward frog hopping (multi
+#     mode; the run-4 production task).
+#
+# State-based gates (the roulade lesson: encode the maneuver in contact/state
+# latches, not clocks):
+#   • FLIGHT = both feet off the ground continuously ≥ JUMP_MIN_FLIGHT_S while
+#     upright-ish AND the trunk-z peak of the stretch exceeds the takeoff z by
+#     ≥ JUMP_MIN_APEX_GAIN AND the ankles rise ≥ JUMP_MIN_FOOT_GAIN (min over
+#     both feet). The apex gate is the run-1 exploit fix: the feet sensor
+#     drops out while standing (100% of episodes, measured) and a bare
+#     contact latch opened the annuity for standing; level dropouts are not
+#     flight, only a RISING trunk is. The FOOT gate hardens it (run-2): the
+#     trunk gain is relative to a single-frame local z, and standing sway
+#     rises 5-8 mm while planted — planted ankles do not move, a genuine
+#     flight lifts the whole robot. Debounced so a foot shuffle at spawn
+#     never latches; gated on tilt so lying on the back kicking legs into the
+#     air is not flight.
+#   • LANDED = a QUALIFIED flight's feet come down AND upright (45°), gated on
+#     the STANCE RHYTHM (run-5): the continuous grounded stance before the
+#     takeoff must last ≥ JUMP_MIN_STANCE_S — a bipedal run is a chain of
+#     short ballistic hops that passes every flight gate, the frog's
+#     stand-crouch-leap rhythm is what does not. The landing opens the
+#     landing-annuity WINDOW (composite/sharp/stand-tax pay inside it):
+#       - multi mode (FrogJump): the window opens at EVERY touchdown, closes
+#         when the next qualified flight is underway or after
+#         JUMP_LAND_WINDOW_S of standing, and its amplitude scales with the
+#         LAST flight's forward arc (_jump_annuity_rate over the FULL target)
+#         — chaining good hops is strictly the argmax (run-4).
+#       - single mode (JumpHigh / LongJump, reset_jump_state(multi_flight=
+#         False)): exactly ONE touchdown pays per episode; the rate basis
+#         (arc, or apex rise for the height task) LOCKS at that first jump,
+#         and the window, once open, stays open to the reset — "do the one
+#         maneuver, then stand" is the task, so standing after it IS the
+#         desired end state, not the run-1-3 exploit (there the bug was the
+#         flat rate + dropout latch, both since fixed).
+#   • DISTANCE / HEIGHT is measured PER FLIGHT (run-4): forward arc from the
+#     last grounded forward-x (distance) or trunk-z apex rise above the
+#     takeoff z (height), paid ONCE per qualified touchdown, capped at the
+#     target — overshooting forfeits the excess (no violence jackpot).
+#   • VERTICALITY (2026-10-10, JumpHigh only): the height payment and the
+#     gain-based annuity rate multiply a Gaussian of the flight's horizontal
+#     displacement from its takeoff point. The tolerance is module state
+#     (jump_vertical_tolerance), written by a curriculum — a FIXED tight
+#     gate had zero partial gradient on the warm-started policy (its hops
+#     move 4-9 cm: 2 cm tolerance ⇒ every jump paid ≈0 ⇒ standing again,
+#     measured it2026-10-10). Wide-then-tight follows the run-3 bar lesson:
+#     the gate must sit where the CURRENT policy scores visibly, then close.
+#
+# Sign conventions in this section: jump_stand_tax / *_penalty return ≥ 0 and
+# take NEGATIVE weights (mjlab style) — EXCEPT the reused
+# trunk_vertical_accel_penalty, which self-negates and takes a POSITIVE weight.
+#
+# Per-env state on the env object (created lazily, reset by reset_jump_state):
+#   env._jump_air_s          — continuous both-feet-off time (s, this flight)
+#   env._jump_air_prev       — _air_s before the current guarded update
+#   env._jump_air_gain       — trunk-z peak of the current stretch − takeoff z
+#   env._jump_air_peak_z     — trunk-z peak of the current no-contact stretch
+#   env._jump_flight_apex    — absolute trunk-z apex of the current/most
+#                              recent flight (takeoff-reset scheme; the
+#                              per-flight HEIGHT payment basis)
+#   env._jump_was_flying     — flying flag of the previous step (takeoff edge)
+#   env._jump_flight_ok      — armed once the CURRENT stretch qualifies as a
+#                              genuine flight; cleared on the next grounded
+#                              frame (per-flight landing events, run-4)
+#   env._jump_touchdown      — True on the frame a qualified flight lands
+#                              (single mode: only the episode's FIRST one)
+#   env._jump_first_done     — single mode: latched at the first PAID
+#                              touchdown; gates all later ones off
+#   env._jump_multi          — mode flag from reset_jump_state (True =
+#                              continuous hopping economics, False = one
+#                              paid jump, window stays open)
+#   env._jump_landed         — annuity WINDOW: open after a touchdown, closed
+#                              by the next qualified flight or the 1.5 s timer
+#                              (multi mode; single mode never closes)
+#   env._jump_flight_arc     — forward arc of the current/most recent flight (m)
+#   env._jump_last_dx        — arc of the flight that opened the current
+#                              window (per-flight payment / window rate basis;
+#                              single mode: locked to the first paid jump)
+#   env._jump_last_gain      — apex rise of the flight that opened the current
+#                              window (height-task rate basis; single mode:
+#                              locked to the first paid jump)
+#   env._jump_grounded_fwd_x — forward-projected trunk x at the last grounded
+#                              upright frame (the takeoff reference)
+#   env._jump_grounded_z     — trunk z at the last grounded upright frame
+#   env._jump_fwd            — spawn forward unit vector in world xy (B, 2)
+#   env._jump_spawn_xy       — spawn trunk xy relative to the env origin (B, 2)
+#   env._jump_spawn_yaw      — spawn yaw (B,)
+#   env._jump_stance_s       — continuous grounded time before the current
+#                              flight (frozen through dropouts; run-5 gate)
+#   env._jump_grounded       — any foot in contact right now (for crash tax)
+
+JUMP_FEET_SENSOR = "feet_ground_contact"
+# Both-feet-off debounce. Probe-measured physics (scripts/probe_jump.py,
+# 2026-09): a scripted open-loop countermovement produces 0.10-0.12 s of
+# both-feet flight; walking/shuffling never lifts BOTH feet for even 2-3
+# consecutive steps. 0.06 s (3 steps) debounces contact flicker without
+# gating out the first real learned hops.
+JUMP_MIN_FLIGHT_S = 0.06
+# Upright gate for the flight integration and the landing latch (tilt-ONLY:
+# a deep countermovement crouch lowers z but keeps the trunk near vertical,
+# so no z-gate anywhere in the state machine).
+JUMP_LAND_TILT_DEG = 45.0
+# Run-1 exploit fix: while standing perfectly still the feet contact sensor
+# DROPS OUT for ≥3 consecutive steps in 100% of episodes (measured, eval of
+# run-1 model_3999: 938 dropout frames / 192 episodes) — the bare "no contact
+# for 0.06 s" latch opened the landing annuity for standing. The latch
+# therefore requires the trunk-z peak of the no-contact stretch to exceed the
+# z at the last grounded frame. Run-3 calibration: the bar must sit AT the
+# ballistic floor of the debounce — a real 0.06 s flight rises only
+# g·t²/8 = 4.4 mm, so the original 8 mm bar demanded 0.08 s flights and put
+# the reward cliff directly on top of the policy's typical sampled jump
+# (per-frame trace, full-DR train env: stretches of 5-8 mm rise hugging the
+# bar, mostly below it — near-zero gradient). 4 mm + the debounce is
+# consistent: every real debounced flight passes, and the ANTI-FAKE load is
+# carried by the ankle gate below.
+JUMP_MIN_APEX_GAIN = 0.004
+# Run-2 hardening: the trunk gain above is relative to a SINGLE-FRAME local
+# z, and standing sway rises ~5-8 mm while planted (the 2026-10-08 eval
+# measured 993 standing-dropout frames across 192 episodes with stretch
+# gains clustering at 4-8 mm). A genuine flight lifts the WHOLE robot:
+# require the ANKLES (min over both feet) to rise above their z at the last
+# grounded frame. 2 mm sits far below the ballistic rise of any debounced
+# flight and just above planted-feet sensor noise (~0-1 mm), so it rejects
+# exactly the planted-feet fakes — with the run-3 bar alignment, this gate
+# is the load-bearing anti-dropout defence.
+JUMP_MIN_FOOT_GAIN = 0.002
+# Run-4 (continuous hopping): the landing-annuity WINDOW. The window opens at
+# every qualified touchdown and closes when the NEXT flight is underway or
+# after this many seconds of standing — each jump buys one window, standing
+# still never extends one. 1.5 s covers the landing settle; beyond that the
+# policy must jump again to reopen.
+JUMP_LAND_WINDOW_S = 1.5
+# Run-5 (the trot exploit, user-visible): a bipedal RUN is physically a chain
+# of small ballistic hops — both-feet-off ~0.05-0.1 s, trunk bob 4-8 mm — so
+# it passes every flight gate and its ~5 cm/cycle ground coverage got paid as
+# "jumps" (measured: 68% of touchdown events peak BELOW standing height, so
+# no apex bar can separate them). The signature that does separate them is
+# the RHYTHM: a frog lands, STANDS/crouches ≥0.35 s, then leaps (measured
+# stance bimodal: trot events <0.2 s at 44%, frog events ≥0.4 s at 48%). A
+# touchdown only pays / opens a window if the continuous grounded stance
+# before its takeoff lasted this long. The timer freezes (not resets) through
+# contact-sensor dropouts so a flicker cannot break up a real stance.
+JUMP_MIN_STANCE_S = 0.35
+# Verticality gate for the JumpHigh payment (2026-10-10): the first shipped
+# version paid the apex RISE regardless of where the jump WENT — a diagonal
+# 6 cm leap that happened to rise 8 mm collected the same height payment as
+# an in-place vertical hop (measured: 85.7% of the trained policy's jumps
+# were sideways-dominant, lateral median 5.2 cm). The drift PENALTIES were
+# supposed to shape this and are orders of magnitude too weak for it —
+# the AGENTS.md lesson verbatim: encode the maneuver in hard state-based
+# gates, not in small penalty nudges. The horizontal displacement from the
+# TAKEOFF point at touchdown, squashed through a Gaussian, now multiplies
+# the height discriminator and the gain-based annuity rate: a genuine
+# vertical hop sways ≪ the tolerance; a leap does not.
+#
+# The tolerance is CURRICULUM state, not a fixed constant (jump_vertical_
+# tolerance module var; written by jump_vertical_tolerance_curriculum): a
+# fixed 2 cm gate had ZERO partial gradient on the warm-started policy —
+# its hops move 4-9 cm, so every jump paid ≈0 and the run re-converged to
+# standing (measured it571, 2026-10-10). Wide-then-tight follows the run-3
+# bar-alignment lesson: the gate must sit where the CURRENT policy scores
+# visibly, then close as the behavior sharpens.
+JUMP_VERT_TOL_FINAL_M = 0.02
+jump_vertical_tolerance = 0.10
+
+
+def jump_vertical_tolerance_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    tol_stages: list[dict],
+) -> torch.Tensor:
+    """Step-staged curriculum for the verticality-gate tolerance (module
+    state ``jump_vertical_tolerance``). ``tol_stages``: ``{"step", "tol"}``
+    dicts, meters. Wide-then-tight: the first stage must sit where the
+    CURRENT policy's hops still score visibly (its measured arcs 4-9 cm ⇒
+    start ≈0.10), the last stage is the production gate (JUMP_VERT_TOL_-
+    FINAL_M). Returns the live tolerance for logging."""
+    del env_ids
+    global jump_vertical_tolerance
+    for stage in tol_stages:
+        if env.common_step_counter > stage["step"]:
+            jump_vertical_tolerance = stage["tol"]
+    return torch.tensor([jump_vertical_tolerance])
+# Landing-annuity amplitude (run-2 fix): the rate is the FORWARD ARC of the
+# best flight over the FULL target. The old max(air, dx) form paid the full
+# pot at half the target distance (dx_ref = 0.5 × target) and carried an
+# unreachable air reference (0.15 s vs the 0.10-0.12 s probe maximum) —
+# measured result: a 2.9 cm-median micro-hop collected the entire annuity
+# (~97 of ~170 reward mass per episode) while jump_distance stayed flat from
+# it1499 to it2398 (2026-10-08 transition run).
+
+
+def _jump_state(env: ManagerBasedRlEnv) -> None:
+    if not hasattr(env, "_jump_air_s"):
+        z = torch.zeros(env.num_envs, device=env.device)
+        b = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._jump_air_s = z.clone()
+        env._jump_air_prev = z.clone()
+        env._jump_air_gain = z.clone()
+        env._jump_air_peak_z = z.clone()
+        env._jump_flight_apex = z.clone()
+        env._jump_flight_arc = z.clone()
+        env._jump_last_dx = z.clone()
+        env._jump_last_gain = z.clone()
+        env._jump_last_vert = torch.ones(env.num_envs, device=env.device)
+        env._jump_grounded_fwd_x = z.clone()
+        env._jump_grounded_z = z.clone()
+        env._jump_foot_peak_z = z.clone()
+        env._jump_foot_grounded_z = z.clone()
+        env._jump_foot_gain = z.clone()
+        env._jump_landed_timer_s = z.clone()
+        env._jump_stance_s = z.clone()
+        env._jump_foot_body_ids: list[int] | None = None
+        env._jump_fwd = torch.ones(env.num_envs, 2, device=env.device)
+        env._jump_spawn_xy = torch.zeros(env.num_envs, 2, device=env.device)
+        env._jump_takeoff_xy = torch.zeros(env.num_envs, 2, device=env.device)
+        env._jump_spawn_yaw = z.clone()
+        env._jump_flight_ok = b.clone()
+        env._jump_touchdown = b.clone()
+        env._jump_landed = b.clone()
+        env._jump_grounded = b.clone()
+        env._jump_was_flying = b.clone()
+        env._jump_first_done = b.clone()
+        # Mode flag: True = continuous hopping (per-flight payment, closing
+        # window); False = one paid jump, window stays open. reset_jump_state
+        # writes the cfg's choice per reset; default keeps the historical
+        # multi behavior for anything that never resets through the event.
+        env._jump_multi = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+        env._jump_last_step = -1
+
+
+def _update_jump_state(env: ManagerBasedRlEnv, asset: Entity) -> None:
+    """Step-guarded per-env jump state machine (see section header for the
+    latch semantics). Every jump reward term calls this; the guard keeps the
+    integration once per control step no matter how many terms read it."""
+    _jump_state(env)
+    step = int(env.common_step_counter)
+    if step == env._jump_last_step:
+        return
+    env._jump_last_step = step
+    dt = env.step_dt
+
+    grounded = _sensor_any_contact(env, JUMP_FEET_SENSOR)
+    if grounded is None:
+        # Sensor missing → fail safe: treat everything as grounded so no
+        # flight can ever latch (the cfg test locks the sensor's existence).
+        grounded = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    env._jump_grounded = grounded
+
+    xy = (
+        asset.data.root_link_pos_w[:, :2]
+        - env.scene.terrain.env_origins[:, :2]
+    )
+    fwd_x = (xy * env._jump_fwd).sum(dim=-1)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+        nan=0.0,
+    )
+
+    quat = asset.data.root_link_quat_w
+    cos_tilt = 1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
+    upright = cos_tilt >= math.cos(math.radians(JUMP_LAND_TILT_DEG))
+
+    # Flight integration: both feet off + upright-ish. Frozen while tilted so
+    # on-back leg flailing never counts as flight nor opens the latch.
+    prev_air = env._jump_air_s
+    flying = (~grounded) & upright
+    air = torch.where(flying, prev_air + dt, torch.zeros_like(prev_air))
+    env._jump_air_prev = prev_air
+    env._jump_air_s = air
+
+    # Trunk-z peak of the current no-contact stretch vs the z at the last
+    # grounded (upright) frame — the APEX GAIN. A real hop rises; a standing
+    # contact dropout stays level (run-1 exploit, see JUMP_MIN_APEX_GAIN).
+    peak = torch.where(flying, torch.maximum(env._jump_air_peak_z, z), z)
+    env._jump_air_peak_z = peak
+    gain = peak - env._jump_grounded_z
+    env._jump_air_gain = gain
+
+    # Ankle-rise gain (run-2, see JUMP_MIN_FOOT_GAIN): min over both feet of
+    # the stretch's ankle-z peak vs the ankle z at the last grounded frame.
+    # Planted feet (standing sway, sensor dropout) do not move; a ballistic
+    # flight lifts them with the trunk.
+    foot_ids = _jump_foot_body_ids(env, asset)
+    foot_z = (
+        asset.data.body_link_pos_w[:, foot_ids, 2]
+        - env.scene.terrain.env_origins[:, 2].unsqueeze(-1)
+    )
+    foot_low = foot_z.min(dim=-1).values
+    foot_peak = torch.where(flying, torch.maximum(env._jump_foot_peak_z, foot_low), foot_low)
+    env._jump_foot_peak_z = foot_peak
+    foot_gain = foot_peak - env._jump_foot_grounded_z
+    env._jump_foot_gain = foot_gain
+
+    # Per-flight apex (height-task payment basis): reset to the takeoff z at
+    # each takeoff edge, accumulate the stretch max through the flight, HOLD
+    # after touchdown — on the touchdown frame the just-ended flight's apex
+    # must still be readable (the capture below runs before the grounded-z
+    # reference refreshes, so apex − grounded_z = the flight's apex rise).
+    was_flying = env._jump_was_flying
+    env._jump_was_flying = flying
+    takeoff = flying & ~was_flying
+    env._jump_flight_apex = torch.where(
+        takeoff,
+        z,
+        torch.where(flying, torch.maximum(env._jump_flight_apex, z), env._jump_flight_apex),
+    )
+    # Takeoff xy for the verticality gate (JumpHigh): frozen at the takeoff
+    # edge, so the gate measures the JUMP's own displacement — pre-jump
+    # shuffling never taxes it (module jump_vertical_tolerance, curriculum-driven).
+    env._jump_takeoff_xy = torch.where(
+        takeoff.unsqueeze(-1), xy, env._jump_takeoff_xy
+    )
+
+    # Per-flight qualification (run-4): arms during a stretch once it clears
+    # all three gates, CLEARS on the next grounded frame — every flight gets
+    # its own landing event, so jumping can chain.
+    qualifies = (
+        (air >= JUMP_MIN_FLIGHT_S)
+        & (gain >= JUMP_MIN_APEX_GAIN)
+        & (foot_gain >= JUMP_MIN_FOOT_GAIN)
+    )
+    prev_ok = env._jump_flight_ok
+    env._jump_flight_ok = (prev_ok | (flying & qualifies)) & ~grounded
+
+    # Forward arc of the flight: takeoff reference is frozen while airborne
+    # (refreshed only on grounded upright frames), so the arc grows through the
+    # flight and holds its last (touchdown) value when the feet come down.
+    arc = fwd_x - env._jump_grounded_fwd_x
+    in_flight = (~grounded) & upright & env._jump_flight_ok
+    env._jump_flight_arc = torch.where(in_flight, arc, env._jump_flight_arc)
+
+    # Touchdown event (run-4, gated run-5): fires ONCE per qualified flight —
+    # the flag carried from the stretch + feet down + upright now — but ONLY
+    # counts if the continuous grounded stance before the takeoff lasted
+    # ≥ JUMP_MIN_STANCE_S. A bipedal run is a chain of short ballistic hops
+    # that passes every flight gate; the stance rhythm is what makes it a
+    # FROG jump (see JUMP_MIN_STANCE_S). SINGLE mode additionally pays only
+    # the episode's FIRST gated touchdown (_jump_first_done): later flights
+    # fire no event, and the rate basis captured below LOCKS to the first
+    # paid jump — the one-maneuver tasks price exactly one jump per episode.
+    multi = env._jump_multi
+    first_done = env._jump_first_done
+    pay_ok = multi | ~first_done
+    prev_stance = env._jump_stance_s
+    stance_ok = prev_stance >= JUMP_MIN_STANCE_S
+    touchdown_raw = prev_ok & grounded & upright
+    touchdown = touchdown_raw & stance_ok & pay_ok
+    env._jump_touchdown = touchdown
+    capture = touchdown_raw & stance_ok & pay_ok
+    env._jump_last_dx = torch.where(capture, env._jump_flight_arc, env._jump_last_dx)
+    # Apex rise of the paid flight, captured while _jump_grounded_z still
+    # holds the TAKEOFF z (its refresh is further down this function).
+    env._jump_last_gain = torch.where(
+        capture, env._jump_flight_apex - env._jump_grounded_z, env._jump_last_gain
+    )
+    # Verticality of the paid flight (JumpHigh): horizontal distance from
+    # the takeoff point at the touchdown frame → [0,1] Gaussian. The height
+    # discriminator and the gain-based annuity rate multiply it — a diagonal
+    # leap buys ~nothing (module jump_vertical_tolerance, curriculum-driven;
+    # see the constant block above for the exploit history).
+    disp = torch.norm(xy - env._jump_takeoff_xy, dim=-1)
+    vert = torch.exp(-(disp / jump_vertical_tolerance).pow(2))
+    env._jump_last_vert = torch.where(capture, vert, env._jump_last_vert)
+    env._jump_first_done = first_done | touchdown
+
+    # Stance timer: accumulates while ANY foot is grounded, freezes through
+    # feet-off frames (flights AND standing contact dropouts — a flicker must
+    # not break up a real stance), resets at every qualified-flight landing
+    # (raw, paid or not: each landing starts a new cycle).
+    new_stance = torch.where(grounded, prev_stance + dt, prev_stance)
+    env._jump_stance_s = torch.where(touchdown_raw, dt, new_stance)
+
+    # Landing-annuity window: opens at a PAID touchdown. Multi mode (run-4):
+    # closes when the NEXT qualified flight is underway (the few open frames
+    # at the start of a flight are a bounded leak) or after JUMP_LAND_WINDOW_S
+    # of standing — standing still collects one window per jump, never a
+    # salary. Single mode: the window never closes — after THE jump, standing
+    # until the timeout is the task's end state, and the rate basis is locked.
+    prev_landed = env._jump_landed
+    timer = torch.where(
+        prev_landed,
+        env._jump_landed_timer_s + dt,
+        torch.zeros_like(env._jump_landed_timer_s),
+    )
+    env._jump_landed_timer_s = timer
+    window_multi = (
+        (prev_landed | touchdown) & ~(flying & qualifies) & (timer < JUMP_LAND_WINDOW_S)
+    )
+    env._jump_landed = torch.where(multi, window_multi, prev_landed | touchdown)
+
+    # Takeoff reference: last grounded upright forward-x / z (frozen during
+    # flight and while fallen, so a post-crash slide never moves them). The
+    # ankle reference refreshes with them (foot-gain takeoff frame).
+    env._jump_grounded_fwd_x = torch.where(
+        grounded & upright, fwd_x, env._jump_grounded_fwd_x
+    )
+    env._jump_grounded_z = torch.where(grounded & upright, z, env._jump_grounded_z)
+    env._jump_foot_grounded_z = torch.where(
+        grounded & upright, foot_low, env._jump_foot_grounded_z
+    )
+
+
+def _jump_foot_body_ids(env: ManagerBasedRlEnv, asset: Entity) -> list[int]:
+    """Ankle body indices for the foot-gain gate (resolved once per env).
+
+    Self-defensively resolved: obs terms (jump_height_state) may call this
+    before ANY reward term has run _update_jump_state, i.e. before
+    _jump_state() has initialized the env attribute."""
+    ids = getattr(env, "_jump_foot_body_ids", None)
+    if ids is None:
+        ids, _ = asset.find_bodies(("ankle_left", "ankle_right"))
+        env._jump_foot_body_ids = ids
+    return ids
+
+
+def reset_jump_state(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    z_min: float = 0.11,
+    z_max: float = 0.12,
+    tilt_max: float = math.radians(5.0),
+    joint_noise_std: float = 0.05,
+    multi_flight: bool = True,
+):
+    """Reset to a standing start (random yaw) and clear the jump state machine.
+
+    Must be registered AFTER ``reset_robot_joints`` in the event dict (dict
+    insertion order = execution order): joints are left at HOME, this event
+    only fixes the root pose and clears the latches. Random yaw makes the task
+    "jump in whatever direction you are facing" — the deployment semantic —
+    and all distance/drift math projects onto the spawn forward vector.
+
+    ``multi_flight`` selects the task economics (see the section header):
+    True = continuous hopping (FrogJump), False = exactly ONE paid jump per
+    episode with a never-closing landing window (JumpHigh / LongJump).
+    """
+    if env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device, dtype=torch.long)
+    num = len(env_ids)
+    asset: Entity = env.scene[asset_cfg.name]
+    _jump_state(env)
+
+    yaw = torch.rand(num, device=env.device) * 2 * np.pi - np.pi
+    pitch = (torch.rand(num, device=env.device) * 2 - 1) * tilt_max
+    roll = (torch.rand(num, device=env.device) * 2 - 1) * max(tilt_max, math.radians(5.0))
+
+    cp = torch.cos(pitch * 0.5); sp = torch.sin(pitch * 0.5)
+    cr = torch.cos(roll * 0.5); sr = torch.sin(roll * 0.5)
+    cy = torch.cos(yaw * 0.5); sy = torch.sin(yaw * 0.5)
+    # ZYX intrinsic Euler → quaternion (yaw * pitch * roll), as in roulade.
+    quat = torch.stack(
+        [cr * cp * cy + sr * sp * sy,
+         sr * cp * cy - cr * sp * sy,
+         cr * sp * cy + sr * cp * sy,
+         cr * cp * sy - sr * sp * cy],
+        dim=1,
+    )
+
+    z = torch.rand(num, device=env.device) * (z_max - z_min) + z_min
+    env.sim.data.qpos[env_ids, 2] = z + _env_origin_z(env, env_ids)
+    env.sim.data.qpos[env_ids, 3:7] = quat
+    env.sim.data.qvel[env_ids, :6] = 0.0
+
+    if joint_noise_std > 0.0:
+        servo_ids = _servo_joint_ids(env, asset)
+        cols = torch.tensor([7 + j for j in servo_ids], device=env.device, dtype=torch.long)
+        noise = torch.randn(num, len(cols), device=env.device) * joint_noise_std
+        env.sim.data.qpos[env_ids.unsqueeze(1), cols.unsqueeze(0)] += noise
+
+    spawn_xy = (
+        env.sim.data.qpos[env_ids, 0:2] - env.scene.terrain.env_origins[env_ids, :2]
+    )
+    fwd = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=1)
+
+    env._jump_air_s[env_ids] = 0.0
+    env._jump_air_prev[env_ids] = 0.0
+    env._jump_air_gain[env_ids] = 0.0
+    env._jump_air_peak_z[env_ids] = 0.0
+    env._jump_flight_apex[env_ids] = 0.0
+    env._jump_flight_arc[env_ids] = 0.0
+    env._jump_last_dx[env_ids] = 0.0
+    env._jump_last_gain[env_ids] = 0.0
+    env._jump_last_vert[env_ids] = 1.0
+    env._jump_grounded_fwd_x[env_ids] = (spawn_xy * fwd).sum(dim=-1)
+    env._jump_grounded_z[env_ids] = z
+    env._jump_takeoff_xy[env_ids] = spawn_xy
+    # Foot-gain reference starts NaN: comparisons with NaN are False, so the
+    # foot gate stays CLOSED until the first grounded-upright frame refreshes
+    # it — no spawn transient can latch a flight without a real grounded
+    # ankle reference (the trunk gates keep their qpos-derived init above).
+    env._jump_foot_peak_z[env_ids] = float("nan")
+    env._jump_foot_grounded_z[env_ids] = float("nan")
+    env._jump_fwd[env_ids] = fwd
+    env._jump_spawn_xy[env_ids] = spawn_xy
+    env._jump_spawn_yaw[env_ids] = yaw
+    env._jump_flight_ok[env_ids] = False
+    env._jump_touchdown[env_ids] = False
+    env._jump_landed[env_ids] = False
+    env._jump_landed_timer_s[env_ids] = 0.0
+    env._jump_stance_s[env_ids] = 0.0
+    env._jump_grounded[env_ids] = False
+    env._jump_was_flying[env_ids] = False
+    env._jump_first_done[env_ids] = False
+    env._jump_multi[env_ids] = multi_flight
+
+
+def _jump_annuity_rate(
+    env: ManagerBasedRlEnv, dx_ref: float, gain_ref: float = 0.0
+) -> torch.Tensor:
+    """Landing-annuity amplitude ∈ [0, 1], scaled by the maneuver quality of
+    the flight that OPENED the current window.
+
+    Run-1 lesson: a flat per-step annuity behind the latch is a jackpot — the
+    cheap latch was openable by standing through feet-sensor dropouts. The
+    run-2 fix made the rate maneuver-proportional; the run-4 change bases it
+    on the LAST flight (not an episode-best frontier) so every window is
+    bought by its own jump — chaining lazy hops keeps only a lazy fraction
+    flowing, and the multi-mode window closes after JUMP_LAND_WINDOW_S anyway.
+
+    Two rate bases: ``gain_ref > 0`` scales by the flight's APEX RISE over
+    ``gain_ref`` × its VERTICALITY (the JumpHigh task — its maneuver is an
+    IN-PLACE height jump: a diagonal leap that rises is paid ~nothing, and
+    an arc rate would pay a perfect vertical jump nothing); otherwise by the
+    FORWARD ARC over ``dx_ref`` (the long-jump tasks). In single mode the
+    captured basis is locked to the episode's first paid jump.
+    """
+    if gain_ref > 0.0:
+        gain = torch.clamp(env._jump_last_gain / max(gain_ref, 1e-6), 0.0, 1.0)
+        return gain * env._jump_last_vert
+    return torch.clamp(env._jump_last_dx / max(dx_ref, 1e-6), 0.0, 1.0)
+
+
+def jump_air_time(
+    env: ManagerBasedRlEnv,
+    air_time_cap_s: float = 0.35,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Both-feet flight time, paid per step as it accumulates, CAPPED at
+    ``air_time_cap_s`` per flight (the dense bootstrap: any genuine flight
+    pays immediately; the cap makes hop-chains bounded instead of farmable).
+    Walking never lifts both feet, and standing contact dropouts have planted
+    ankles (run-1/2 exploits), so neither collects. Run-3: payment is gated
+    ONLY on the ankle-rise gate (JUMP_MIN_FOOT_GAIN) — the trunk apex gate
+    stays on the LATCH, but must not gate this dense term, or sub-apex real
+    hops pay nothing and the bootstrap gradient vanishes exactly where the
+    policy needs it."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_jump_state(env, asset)
+    growth = (
+        torch.clamp(env._jump_air_s, max=air_time_cap_s)
+        - torch.clamp(env._jump_air_prev, max=air_time_cap_s)
+    ).clamp(min=0.0)
+    real = (env._jump_foot_gain >= JUMP_MIN_FOOT_GAIN).float()
+    return growth * real
+
+
+def jump_distance_bonus(
+    env: ManagerBasedRlEnv,
+    target_x: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """THE long-jump task term: every qualified flight pays its own forward
+    arc (capped at ``target_x``, normalized by the target) ONCE, at its
+    touchdown.
+
+    Multi mode (FrogJump, run-4): each jump is paid on its own — hopping far,
+    repeatedly, is the argmax. Single mode (LongJump): only the episode's
+    FIRST gated touchdown pays (the state machine locks after it) — one jump,
+    then stand. Walking pays nothing (the arc is measured across a qualified
+    both-feet flight), a lazy hop pays its own small fraction, and
+    overshooting the target forfeits the excess (no violence jackpot)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_jump_state(env, asset)
+    paid = torch.clamp(env._jump_last_dx, max=target_x) / max(target_x, 1e-6)
+    return paid * env._jump_touchdown.float()
+
+
+def jump_height_bonus(
+    env: ManagerBasedRlEnv,
+    target_z: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """THE JumpHigh task term: a qualified flight pays its own APEX RISE
+    (trunk-z peak above the takeoff z, capped at ``target_z``, normalized)
+    ONCE, at its touchdown — × its VERTICALITY (a [0,1] Gaussian of the
+    horizontal displacement from the takeoff point, captured by the state
+    machine; see jump_vertical_tolerance).
+
+    Vertical means VERTICAL: an in-place hop pays in full, a diagonal leap
+    pays ~nothing no matter how high it rises — the first shipped version
+    paid the bare rise and the policy shipped 6 cm sideways leaps (measured,
+    2026-10-10). The rise is captured at the touchdown frame
+    (``_jump_last_gain``: flight apex − takeoff z), so walking buys nothing
+    (no qualified flight), a standing dropout buys nothing (the latch gates
+    it), and a deep crouch before the leap buys nothing (the reference is
+    the last grounded frame — only the FLIGHT's rise counts)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_jump_state(env, asset)
+    paid = torch.clamp(env._jump_last_gain, min=0.0, max=target_z) / max(target_z, 1e-6)
+    return paid * env._jump_last_vert * env._jump_touchdown.float()
+
+
+def jump_height_state(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """[trunk_z, left_ankle_z, right_ankle_z] above the env origin — a
+    CRITIC-ONLY privileged height state (never in the actor: the real robot
+    has no height sensor, and the 61D obs contract is what deployment
+    hot-swaps — velocity's own foot_height obs is critic-only for the same
+    reason).
+
+    The jump rewards are height-heavy (landing height, the apex rise, the
+    stand-tax shortfall) and latch-gated on feet contact; the value function
+    sees the exact quantities they measure here instead of inferring height
+    from joint dynamics. On the jump family's always-plane terrain the env
+    origin z IS ground level, so no raycast sensor is needed (velocity's
+    foot_height_scan raycast is the rough-terrain generalization of this)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    origins_z = env.scene.terrain.env_origins[:, 2]
+    trunk_z = torch.nan_to_num(asset.data.root_link_pos_w[:, 2] - origins_z, nan=0.0)
+    foot_ids = _jump_foot_body_ids(env, asset)
+    foot_z = asset.data.body_link_pos_w[:, foot_ids, 2] - origins_z.unsqueeze(-1)
+    foot_z = torch.nan_to_num(foot_z, nan=0.0)
+    return torch.cat([trunk_z.unsqueeze(-1), foot_z], dim=-1)
+
+
+def jump_landing_composite(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    height_std: float,
+    upright_std: float,
+    pose_std: float,
+    joint_indices: list,
+    dx_ref: float = 0.08,
+    gain_ref: float = 0.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """standing_composite_score × landing latch × annuity rate.
+
+    Every step spent standing at HOME after a genuine jump-and-land pays
+    (finish-on-the-feet dominates every partial outcome). Zero before the
+    latch, so the standing spawn cannot farm it; the product form means a
+    crumpled or tilted landing collapses the whole score. The annuity RATE
+    scales with the flight's maneuver quality over its target — forward arc
+    over ``dx_ref`` (long-jump tasks) or apex rise over ``gain_ref``
+    (JumpHigh; run-2: the FULL target — the old half-target/air-time form let
+    a 2.9 cm micro-hop collect the entire pot)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_jump_state(env, asset)
+    score = standing_composite_score(
+        env,
+        target_height=target_height,
+        height_std=height_std,
+        upright_std=upright_std,
+        pose_std=pose_std,
+        joint_indices=joint_indices,
+        asset_cfg=asset_cfg,
+    )
+    rate = _jump_annuity_rate(env, dx_ref, gain_ref)
+    return score * env._jump_landed.float() * rate
+
+
+def jump_landing_sharp(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    height_std: float = 0.015,
+    upright_std: float = 0.3,
+    dx_ref: float = 0.08,
+    gain_ref: float = 0.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Tight-std upright × height Gaussians × landing latch × annuity rate.
+
+    The broad composite scores ~0.5 on a 1-cm-crouch / half-tilt landing
+    basin; the sharp layer splits it ~10× (roulade run-4 lesson)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_jump_state(env, asset)
+    quat = asset.data.root_link_quat_w
+    tilt_sq = 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
+    upright_g = torch.exp(-tilt_sq / (upright_std * upright_std))
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    height_g = torch.exp(-((z - target_height) / height_std) ** 2)
+    rate = _jump_annuity_rate(env, dx_ref, gain_ref)
+    return upright_g * height_g * env._jump_landed.float() * rate
+
+
+def jump_stand_tax(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    dx_ref: float = 0.08,
+    gain_ref: float = 0.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Height shortfall below target while the landing latch is open.
+
+    Returns ``max(0, target − z) × landed × annuity rate`` — a POSITIVE
+    quantity; use a NEGATIVE weight (mjlab cost convention). After a
+    jump-and-land, every step spent crumpled below standing height costs —
+    "land in a heap" must be net-negative, not a free basin (roulade run-3 /
+    standup lesson). The latch keeps pre-jump standing and the flight itself
+    untaxed; the rate scaling keeps the tax proportional to the arc- or
+    gain-scaled annuity it protects (run-1/2 lessons)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_jump_state(env, asset)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    shortfall = torch.clamp(target_height - z, min=0.0)
+    rate = _jump_annuity_rate(env, dx_ref, gain_ref)
+    return shortfall * env._jump_landed.float() * rate
+
+
+def jump_yaw_drift_penalty(
+    env: ManagerBasedRlEnv,
+    yaw_tol_rad: float = 0.5,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Quadratic tax on heading change beyond ``yaw_tol_rad`` from the spawn
+    yaw (positive quantity; use a NEGATIVE weight). A long jump goes straight
+    ahead; tolerance keeps the landing absorb wiggle free. 0.5 rad (run-2):
+    measured real flights yaw 13.5° median / 20.8° p90 — the old 0.35 rad
+    tolerance taxed the skill exactly while it was still unreliable."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_jump_state(env, asset)
+    quat = asset.data.root_link_quat_w
+    yaw_now = torch.atan2(
+        2.0 * (quat[:, 0] * quat[:, 3] + quat[:, 1] * quat[:, 2]),
+        1.0 - 2.0 * (quat[:, 2].pow(2) + quat[:, 3].pow(2)),
+    )
+    drift = wrap_to_pi(yaw_now - env._jump_spawn_yaw)
+    excess = torch.clamp(drift.abs() - yaw_tol_rad, min=0.0)
+    return excess.pow(2)
+
+
+def jump_lateral_drift_penalty(
+    env: ManagerBasedRlEnv,
+    lat_tol_m: float = 0.03,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Quadratic tax on sideways displacement (perpendicular to the spawn
+    forward vector) beyond ``lat_tol_m`` (positive; use a NEGATIVE weight)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_jump_state(env, asset)
+    dxy = (
+        asset.data.root_link_pos_w[:, :2]
+        - env.scene.terrain.env_origins[:, :2]
+        - env._jump_spawn_xy
+    )
+    perp = torch.stack([-env._jump_fwd[:, 1], env._jump_fwd[:, 0]], dim=1)
+    lat = (dxy * perp).sum(dim=-1)
+    excess = torch.clamp(lat.abs() - lat_tol_m, min=0.0)
+    return excess.pow(2)
+
+
+def jump_forward_drift_penalty(
+    env: ManagerBasedRlEnv,
+    fwd_tol_m: float = 0.03,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Quadratic tax on FORWARD displacement (along the spawn forward vector)
+    beyond ``fwd_tol_m`` (positive; use a NEGATIVE weight).
+
+    The JumpHigh companion of jump_lateral_drift_penalty: a height jump goes
+    UP and lands where it took off, so BOTH horizontal axes are taxed — the
+    long-jump tasks deliberately do NOT tax forward motion (that is the
+    maneuver they pay for)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_jump_state(env, asset)
+    dxy = (
+        asset.data.root_link_pos_w[:, :2]
+        - env.scene.terrain.env_origins[:, :2]
+        - env._jump_spawn_xy
+    )
+    fwd = (dxy * env._jump_fwd).sum(dim=-1)
+    excess = torch.clamp(fwd.abs() - fwd_tol_m, min=0.0)
+    return excess.pow(2)
+
+
+def jump_crash_tax(
+    env: ManagerBasedRlEnv,
+    gate_tilt_above_deg: float = 40.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Flat 1.0 while crashed: fallen (tilt-only gate) AND touching the
+    ground (positive quantity; use a NEGATIVE weight).
+
+    fallen_state_penalty × grounded: the tilt-only gate spares deep
+    countermovement crouches, and the grounded factor spares the flight
+    itself — a long jump may transiently pitch past the tilt gate mid-air
+    and must not be taxed for flying. Hysteresis release (via
+    fallen_state_penalty) means a crash keeps paying until the robot is
+    genuinely back up."""
+    asset: Entity = env.scene[asset_cfg.name]
+    fallen = fallen_state_penalty(
+        env,
+        gate_tilt_above_deg=gate_tilt_above_deg,
+        release_tilt_below_deg=25.0,
+        release_z_above=0.105,
+        asset_cfg=asset_cfg,
+    )
+    _update_jump_state(env, asset)
+    return fallen * env._jump_grounded.float()

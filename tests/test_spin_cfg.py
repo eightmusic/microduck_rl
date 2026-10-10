@@ -108,3 +108,13 @@ def test_obs_parity_with_roller_crouch():
         assert list(spin.observations[grp].terms.keys()) == list(
             crouch.observations[grp].terms.keys()
         ), f"layout d'observation divergent sur le groupe {grp}"
+
+
+def test_bam_friction_fields_are_expanded_per_world():
+    # Regression: BAM writes per-env dof_frictionloss/dof_damping every step;
+    # without the startup expansion event the env crashes at reset
+    # ("these model fields are not expanded per world", 2026-10-08).
+    cfg = make_microduck_spin_env_cfg()
+    term = cfg.events["expand_bam_friction_fields"]
+    assert term.mode == "startup"
+    assert term.func is microduck_mdp.expand_bam_friction_fields

@@ -75,6 +75,14 @@ from .microduck_roulade_env_cfg import (
     make_microduck_roulade_env_cfg,
     MicroduckRouladeRlCfg,
 )
+from .microduck_jump_env_cfg import (
+    make_microduck_frog_jump_env_cfg,
+    make_microduck_jump_high_env_cfg,
+    make_microduck_long_jump_env_cfg,
+    MicroduckFrogJumpRlCfg,
+    MicroduckJumpHighRlCfg,
+    MicroduckLongJumpRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Standard velocity task
@@ -230,6 +238,36 @@ register_mjlab_task(
     env_cfg=make_microduck_roulade_env_cfg(),
     play_env_cfg=make_microduck_roulade_env_cfg(play=True),
     rl_cfg=MicroduckRouladeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Jump family — THREE tasks on one shared recipe (microduck_jump_env_cfg):
+#   JumpHigh — one VERTICAL jump for height (single mode: one paid touchdown);
+#   LongJump — one forward standing long jump, then stand (single mode);
+#   FrogJump — continuous forward frog hopping, every hop paid (multi mode,
+#   the run-4 production task; experiment name `microduck_jump` kept so the
+#   trained run-4 checkpoints stay this task's policy).
+register_mjlab_task(
+    task_id="Mjlab-JumpHigh-Flat-MicroDuck",
+    env_cfg=make_microduck_jump_high_env_cfg(),
+    play_env_cfg=make_microduck_jump_high_env_cfg(play=True),
+    rl_cfg=MicroduckJumpHighRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-LongJump-Flat-MicroDuck",
+    env_cfg=make_microduck_long_jump_env_cfg(),
+    play_env_cfg=make_microduck_long_jump_env_cfg(play=True),
+    rl_cfg=MicroduckLongJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-FrogJump-Flat-MicroDuck",
+    env_cfg=make_microduck_frog_jump_env_cfg(),
+    play_env_cfg=make_microduck_frog_jump_env_cfg(play=True),
+    rl_cfg=MicroduckFrogJumpRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 

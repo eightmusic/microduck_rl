@@ -225,6 +225,12 @@ def make_microduck_spin_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     )
 
     # === EVENTS ===
+    # BAM actuator writes per-env dof_frictionloss/dof_damping → the model
+    # fields must be expanded per world (crash at reset without this; every
+    # BAM-using cfg must register this startup event — AGENTS.md invariant).
+    cfg.events["expand_bam_friction_fields"] = EventTermCfg(
+        func=microduck_mdp.expand_bam_friction_fields, mode="startup",
+    )
     cfg.events["reset_action_history"] = EventTermCfg(
         func=microduck_mdp.reset_action_history, mode="reset",
     )
