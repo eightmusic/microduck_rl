@@ -107,4 +107,3 @@ def make_microduck_velocity_base_cfg(*, robot: MicroduckRobotProfile, play=False
     configure_shared_velocity_commands(cfg)
     add_shared_pose_rewards(cfg)
     return cfg
-EOF

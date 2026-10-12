@@ -14,13 +14,14 @@
   └──────────────────────┴───────────────────────────────┴───────────────┘
 
 三个任务共享同一套机器人/观测/DR/锁存配方（_make_jump_base）和同一个逐
-环境状态机（mdp.py 跳跃段），模式标志在 reset 时写入：
+环境状态机（mdp.py：_update_jump_state 函数及其上方的跳跃段段头注释，
+# 约在 mdp.py 7460 行起），模式标志在 reset_jump_state 里写入：
   • multi_flight=True（FrogJump）：每次合格触地都付分，站立
     JUMP_LAND_WINDOW_S 后落地窗口关闭 —— 连跳是好跳就是严格最优。
   • multi_flight=False（JumpHigh / LongJump）：每回合只付第一次合格触地，
-    年金率锁定在那一次跳上，窗口一旦打开就永不关闭 —— "完成那一次动作
-    然后站稳"就是这两个任务的目标终态，因此跳跃后的逐步落地年金是设计
-    意图，而非 run-1-3 的漏洞（当时的问题在于平价年金 + 可被站立骗开的
+    得分比例锁定在那一次跳上，窗口一旦打开就永不关闭 —— "完成那一次动作
+    然后站稳"就是这两个任务的目标终态，因此跳跃后每一步的落地持续奖励是设计
+    意图，而非 run-1-3 的漏洞（当时的问题在于不随跳质缩放的每步奖励 + 可被站立骗开的
     锁存，两者均已在状态机里修复）。
 
 实验名：FrogJump 保留 `microduck_jump` —— run-4 生产训练
@@ -46,24 +47,25 @@ WARM-START 配方（新任务不要从头训 —— 跳跃技能已经存在；2
     Patch 6（mdp.py）捕获该错误并只加载 ACTOR，critic + optimizer 重新
     初始化 —— 策略保住技能，价值函数几百 iter 内重学。跨过该边界的 run
     会在启动时打印一次 "[mdp] Patch 6: checkpoint CRITIC obs mismatch"。
-  ⚠️ 薪资悬崖警告（run-4，2026-10-09）：永远不要把生产训练过的跳跃
-    checkpoint 暖启动进带薪资阶段的课程表（已删除的 discovery→transition
-    桥）—— 实测两次：平均动作 std 0.37 → 1.00，薪资降档的瞬间策略退化成
+  ⚠️ 引导奖励悬崖警告（run-4，2026-10-09）：永远不要把生产训练过的跳跃
+    checkpoint 暖启动进带探索引导阶段的课程表（已删除的 discovery→transition
+    桥）—— 实测两次：平均动作 std 0.37 → 1.00，引导奖励降档的瞬间策略退化成
     噪声。transition cfg 已删除；直接训练生产任务。
 
-已烘焙进共享状态机的 run 教训（细节见 mdp.py 段头；每一条都花掉过一次
+已烘焙进共享状态机的 run 教训（细节见 mdp.py 跳跃段段头注释，即
+# "# 跳跃任务家族（三个任务）—— 共享状态机" 那一块；每一条都花掉过一次
 run 才学到）：
-  • run-1：常开的 upright 奖励是一份站立薪资，压过一切冒险尝试（站着收
+  • run-1：常开的 upright 奖励等于站着白拿分，压过一切冒险尝试（站着收
     了 4000 iter）；站立时足底接触传感器会 DROP OUT（100% 的回合实测），
     裸接触锁存会给站立付分 → apex 增量门（JUMP_MIN_APEX_GAIN）。
-  • run-2：半目标 + 不可达空中参考的 max(air, dx) 付率让 2.9 cm 的微跳
-    收走全部年金 → 付率只按动作质量对满目标计；踝门（JUMP_MIN_FOOT_GAIN）
+  • run-2：半目标 + 不可达空中参考的 max(air, dx) 得分比例让 2.9 cm 的微跳
+    拿走全部落地奖励 → 得分比例只按动作质量对满目标计；踝门（JUMP_MIN_FOOT_GAIN）
     封掉"种植足摇摆"的假飞行。
   • run-3：单向落地锁把计分前沿冻在第一次微落地；锁存门槛必须落在防抖的
     弹道地板上（4 mm 躯干 = g·(0.06 s)²/8），不能压在策略典型采样跳的
     正上方。
   • run-4（用户评审"跳一次就站着不动，距离也短"）：每回合一次的距离付款
-    + 永不关闭的年金让"跳一次然后冻结"成为连续任务的最优 —— 逐次付款 +
+    + 永不关闭的落地窗口让"跳一次然后冻结"成为连续任务的最优 —— 逐跳计分 +
     会关闭的窗口修好了它，这就是 FrogJump。同一套经济学反过来正是两个单
     跳任务的定义，所以模式开关放在共享状态机里。
   • run-5：双足 RUN 物理上就是一串小弹道跳 —— 能通过所有飞行门；只有
@@ -153,10 +155,10 @@ JUMP_HIGH_APEX_CEILING = 0.16
 # 从 step 0 保持 25% 让梯度活着；PROTECT_FULL_STEP 时上满权重。
 PROTECT_STAGE0_FRAC = 0.25
 PROTECT_FULL_STEP   = 2000 * 24
-HEAD_IMPACT_WEIGHT    = -0.01      # 头部子树每超 15 N 计一分
-TRUNK_IMPACT_WEIGHT   = -0.01      # 躯干壳每超 20 N 计一分
-SERVO_ACC_SPIKE_WEIGHT = -1e-3     # 每 rad/s² 超 300 计一分（舵机求和）
-SERVO_STALL_WEIGHT    = -0.05      # 每个堵转舵机每步
+HEAD_IMPACT_WEIGHT    = -0.01      # 头部子树合力每超 15 N，按超出量扣分
+TRUNK_IMPACT_WEIGHT   = -0.01      # 躯干壳合力每超 20 N，按超出量扣分
+SERVO_ACC_SPIKE_WEIGHT = -1e-3     # 角加速度每超 300 rad/s² 扣分（全部舵机求和）
+SERVO_STALL_WEIGHT    = -0.05      # 每个堵转舵机每步扣一次
 GENTLE_LANDING_WEIGHT = 0.005      # 正数：trunk_vertical_accel_penalty 自带负号
 HEAD_IMPACT_THRESH_N  = 15.0
 TRUNK_IMPACT_THRESH_N = 20.0
@@ -205,13 +207,14 @@ def _make_jump_base(
     apex_ceiling: float = JUMP_APEX_CEILING,
     collapse_smoothness: bool = True,
 ) -> ManagerBasedRlEnvCfg:
-    """三个跳跃任务共享的全部内容：机器人、传感器、引导奖励、落地年金、
+    """三个跳跃任务共享的全部内容：机器人、传感器、引导奖励、落地奖励窗口、
     坠落经济学、观测（61D 家族契约）、DR、终止、事件、地形和保护/平滑度
     课程。各任务的判别项（距离 vs 高度）和漂移税由公开工厂函数追加。
 
-    ``dx_ref`` / ``gain_ref`` 选择落地年金的付率基准（跳远任务按前向
+    ``dx_ref`` / ``gain_ref`` 选择落地奖励窗口的得分基准（跳远任务按前向
     弧长，JumpHigh 按 apex 增量 —— 见 mdp._jump_annuity_rate）；
-    ``multi_flight`` 选择触地/窗口经济学（见 mdp.py 跳跃段头）。
+    ``multi_flight`` 选择触地/窗口经济学（语义定义在 mdp.py 的
+    reset_jump_state docstring + _update_jump_state 的窗口段）。
     """
 
     feet_ground_cfg = ContactSensorCfg(
@@ -237,7 +240,7 @@ def _make_jump_base(
         num_slots=1,
     )
 
-    # 头部/躯干对地力传感器 —— 坠落式保护（摔烂的跳会计费；脚先着地的跳
+    # 头部/躯干对地力传感器 —— 坠落式保护（摔烂的跳会被罚分；脚先着地的跳
     # 永远碰不到阈值）。
     head_ground_cfg = ContactSensorCfg(
         name="head_ground_contact",
@@ -304,10 +307,10 @@ def _make_jump_base(
         },
     )
 
-    # 落地年金 —— 宽层 + 锐层（roulade run-4 教训：宽层够到，锐层收尾），
+    # 落地奖励窗口 —— 宽层 + 锐层（roulade run-4 教训：宽层够到，锐层收尾），
     # 再加站立税砸碎"落地后瘫成一团"的盆地。全部以落地锁存为门，并按
-    # 付费飞行的动作质量对满目标缩放（run-1 教训：平价年金是站立就能收
-    # 的 jack；run-2 教训：半目标的付率让 2.9 cm 微跳收走全部 —— 基准必须
+    # 付费飞行的动作质量对满目标缩放（run-1 教训：不随跳质缩放的每步奖励站立
+    # 就能白拿；run-2 教训：半目标的得分比例让 2.9 cm 微跳拿走全部 —— 基准必须
     # 是满目标）。
     cfg.rewards["jump_landing"] = RewardTermCfg(
         func=microduck_mdp.jump_landing_composite,
@@ -322,6 +325,9 @@ def _make_jump_base(
             "gain_ref":       gain_ref,
         },
     )
+    # 锐层：紧方差（高度 1.5 cm / 直立 0.3）的同一批高斯 —— 宽层在"1 cm
+    # 下蹲 / 半倾斜"的落地上还给 ~0.5 分，锐层把它拉开 ~10 倍（roulade
+    # run-4 教训：宽层够到、锐层收尾）。实现：mdp.jump_landing_sharp。
     cfg.rewards["jump_landing_sharp"] = RewardTermCfg(
         func=microduck_mdp.jump_landing_sharp,
         weight=1.0,
@@ -344,7 +350,8 @@ def _make_jump_base(
         },
     )
 
-    # 坠落经济学（见 mdp.py 跳跃段）。正数物理量 → 负权重。
+    # 坠落经济学：fallen_state_penalty（倾角迟滞门）× 是否触地，实现在
+    # mdp.jump_crash_tax。正数物理量 → 负权重。
     cfg.rewards["jump_crash_tax"] = RewardTermCfg(
         func=microduck_mdp.jump_crash_tax,
         weight=-0.3,
@@ -355,45 +362,74 @@ def _make_jump_base(
     # action_rate 从 step 0 保留一个轻地板（run-4：连续蛙跳消耗的动作量是
     # 单跳的 ~5 倍 —— 该税绝不能和任务奖励分庭抗礼），再按课程爬坡。
     cfg.rewards["action_rate_l2"] = RewardTermCfg(func=mdp.action_rate_l2, weight=-0.05)
+    # 力矩变化率 step 0 权重 0：平滑度税在技能存在之前是"什么都不做"的
+    # 同谋（standup 时机教训），由课程在后期爬到 −5e-4。
     cfg.rewards["joint_torque_rate_l2"] = RewardTermCfg(
         func=microduck_mdp.joint_torque_rate_l2, weight=0.0
     )
 
+    # 躯干角速度/角动量：压轻微晃动而不挡跳跃所需的俯仰 —— 权重压到
+    # 很小（25 cm 机器人起跳本来就要带俯仰，AGENTS.md：别用人形尺度的
+    # 直觉上旋转速度帽）。soft_landing 与 gentle_landing 重复，删。
     cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("trunk_base",)
     cfg.rewards["body_ang_vel"].weight = -0.002   # 跳跃会俯仰，但要温和
     cfg.rewards["angular_momentum"].weight = -0.001
     cfg.rewards.pop("soft_landing", None)
 
     # 常开 upright 已删除（roulade 先例；run-1 教训）：权重 0.5 时光是站着
-    # 就每步白拿 ~0.5 —— 一份旱涝保收的薪资，压过了冒险的年金，教会
+    # 就每步白拿 ~0.5 —— 一笔稳赚的保底分，压过了冒险的落地奖励，教会
     # run-1 站了 4000 iter。落地直立性由带锁存门的项计价。
     if "upright" in cfg.rewards:
         del cfg.rewards["upright"]
 
-    # 舵机保护栈 —— step 0 打 25%，PROTECT_FULL_STEP 上满。
-    # ⚠️ gentle_landing 自带负号（返回 -|a_z|）→ 必须配正权重（罚项符号
-    # 约定；配负权重等于奖励暴力）。
+    # 舵机保护栈 —— XL330 齿轮箱经济学：跳跃是这台机器人最高频的剧烈动作，
+    # 这五项从不同侧面给"暴力落地/堵转/甩头"计价（velstand 同款）。
+    # step 0 打 25%（PROTECT_STAGE0_FRAC）保梯度活着，PROTECT_FULL_STEP
+    # （2000 iter）上满。
+    #
+    # 各项的实现（都在 mdp.py，函数名可直接搜）：
+    #   • head_impact / trunk_impact → body_impact_cost：对地接触合力超过
+    #     阈值（头 15 N / 躯干 20 N）的部分线性扣分 —— 摔烂的跳计费大，
+    #     脚先着地的正常跳碰不到阈值。
+    #   • servo_acc_spike → servo_acc_spike_penalty：全部舵机角加速度
+    #     （关节速度差分）超 300 rad/s² 的部分求和 —— 齿轮箱的载荷来自
+    #     冲击反驱，策略能左右的只有"怎么落、落哪里"。
+    #   • servo_stall → servo_stall_penalty：大力（>0.4 N·m）但不动
+    #     （<0.5 rad/s）的舵机数 —— 真顶住卡死才触发，正常支撑远够不着。
+    #   • gentle_landing → trunk_vertical_accel_penalty：返回 -|躯干 a_z|
+    #     （自带负号！）—— 同时罚硬着陆的减速尖峰、奖励匀速下蹲。
+    # ⚠️ gentle_landing 是唯一自带负号的函数 → 必须配正权重（罚项符号
+    # 约定；配负权重等于双重负号，反过来奖励暴力落地）。
     _frac = PROTECT_STAGE0_FRAC
+    # 头部子树（头壳/相机等 HEAD_BODY_NAMES）对地合力超过 HEAD_IMPACT_THRESH_N
+    # 的部分，按超出牛顿数逐步扣分（负权重 × 超出量）。
     cfg.rewards["head_impact"] = RewardTermCfg(
         func=microduck_mdp.body_impact_cost,
         weight=HEAD_IMPACT_WEIGHT * _frac,
         params={"sensor_name": head_ground_cfg.name, "threshold": HEAD_IMPACT_THRESH_N},
     )
+    # 躯干壳（trunk_base）对地合力超过 TRUNK_IMPACT_THRESH_N 的部分同理 ——
+    # 仰面/前扑着地主要算在这里。
     cfg.rewards["trunk_impact"] = RewardTermCfg(
         func=microduck_mdp.body_impact_cost,
         weight=TRUNK_IMPACT_WEIGHT * _frac,
         params={"sensor_name": trunk_ground_cfg.name, "threshold": TRUNK_IMPACT_THRESH_N},
     )
+    # 14 个舵机的角加速度超阈部分之和（rad/s²），差分自关节速度、reset 帧
+    # 置零 —— 齿轮箱冲击载荷的直接代理。
     cfg.rewards["servo_acc_spike"] = RewardTermCfg(
         func=microduck_mdp.servo_acc_spike_penalty,
         weight=SERVO_ACC_SPIKE_WEIGHT * _frac,
         params={"acc_thresh": SERVO_ACC_THRESH},
     )
+    # 每个堵转舵机（力矩大但关节不动）每步计 1 —— 卡死/顶死探测。
     cfg.rewards["servo_stall"] = RewardTermCfg(
         func=microduck_mdp.servo_stall_penalty,
         weight=SERVO_STALL_WEIGHT * _frac,
         params={"torque_thresh": SERVO_STALL_TORQUE, "vel_thresh": SERVO_STALL_VEL},
     )
+    # -|躯干竖直加速度|：硬着陆的减速尖峰直接计价。⚠️ 唯一"自带负号"的
+    # 函数，所以用正权重。
     cfg.rewards["gentle_landing"] = RewardTermCfg(
         func=microduck_mdp.trunk_vertical_accel_penalty,
         weight=GENTLE_LANDING_WEIGHT * _frac,
@@ -517,14 +553,21 @@ def _make_jump_base(
     )
 
     # ── 事件 ──────────────────────────────────────────────────────────────────
+    # BAM 执行器的关节摩擦由执行器自己算，dof_frictionloss 被清零 ——
+    # 这个 startup 事件把随机化字段扩到 BAM 的摩擦参数上，否则
+    # randomize_joint_friction 是静默空转（AGENTS.md 不变量）。
     cfg.events["expand_bam_friction_fields"] = EventTermCfg(
         func=microduck_mdp.expand_bam_friction_fields,
         mode="startup",
     )
+    # 策略的动作历史缓冲在每次 reset 清零 —— 新回合的第一步不能读上一
+    # 回合的动作（否则动作差分/平滑度项会跨回合串味）。
     cfg.events["reset_action_history"] = EventTermCfg(
         func=microduck_mdp.reset_action_history,
         mode="reset",
     )
+    # 足底摩擦 DR：只随机两个足底碰撞几何体，范围 0.7-1.3 × 默认值
+    # （继承自 velocity 配方的鞋底摩擦不确定性）。
     cfg.events["foot_friction"].params["asset_cfg"].geom_names = foot_frictions_geom_names
     cfg.events["foot_friction"].params["ranges"] = (0.7, 1.3)
 
@@ -543,9 +586,14 @@ def _make_jump_base(
         },
     )
 
+    # 删除 velocity 配方的定时推搡：跳跃中途来一推没有物理意义
+    # （ENABLE_VELOCITY_PUSHES = False 的落地形式）。
     if "push_robot" in cfg.events:
         del cfg.events["push_robot"]
 
+    # 躯干质心随机化：±3 mm 起步、课程爬到 ±15 mm（真实机器人负载/装配
+    # 偏差）。dr.body_ipos 用 "add" 且原生不累积（mjlab 1.3.0 每次重读
+    # 编译期默认值，AGENTS.md 不变量）。
     if ENABLE_COM_RANDOMIZATION:
         cfg.events["randomize_com"] = EventTermCfg(
             func=dr.body_ipos,
@@ -557,6 +605,8 @@ def _make_jump_base(
             },
         )
 
+    # 头部组件（相机/舵机组）质心随机化：头部占体重 ~38%，它的装配偏差
+    # 对平衡影响不成比例，单独随机、范围小于躯干。
     if ENABLE_HEAD_COM_RANDOMIZATION:
         cfg.events["randomize_head_com"] = EventTermCfg(
             func=dr.body_ipos,
@@ -568,6 +618,7 @@ def _make_jump_base(
             },
         )
 
+    # 转子惯量（armature）缩放 0.9-1.1：齿轮箱反射惯量的制造分散。
     if ENABLE_ARMATURE_RANDOMIZATION:
         cfg.events["randomize_armature"] = EventTermCfg(
             func=dr.joint_armature,
@@ -579,6 +630,9 @@ def _make_jump_base(
             },
         )
 
+    # PD 增益随机化 —— 当前关闭（对齐 velocity）：BAM 是电压驱动模型，
+    # kp/kd 不是它的真实参数轴，随机它们等于给一个不存在的制造缺陷训练
+    # 容忍度。保留代码路径以备将来开。
     if ENABLE_KP_RANDOMIZATION or ENABLE_KD_RANDOMIZATION:
         kp_range = KP_RANDOMIZATION_RANGE if ENABLE_KP_RANDOMIZATION else (1.0, 1.0)
         kd_range = KD_RANDOMIZATION_RANGE if ENABLE_KD_RANDOMIZATION else (1.0, 1.0)
@@ -593,6 +647,7 @@ def _make_jump_base(
             },
         )
 
+    # 质量/惯量整体缩放（对数空间 ±5%）：电池重量、线缆、打印公差。
     if ENABLE_MASS_INERTIA_RANDOMIZATION:
         _mi_lo, _mi_hi = MASS_INERTIA_RANDOMIZATION_RANGE
         cfg.events["randomize_mass_inertia"] = EventTermCfg(
@@ -604,6 +659,9 @@ def _make_jump_base(
             },
         )
 
+    # 关节摩擦缩放 0.9-1.1 —— 随机的是 BAM 执行器的 friction_scale
+    # （不是 dof_frictionloss，它在 BAM 下是 0：AGENTS.md 警告的静默
+    # 空转陷阱）。
     if ENABLE_JOINT_FRICTION_RANDOMIZATION:
         cfg.events["randomize_joint_friction"] = EventTermCfg(
             func=microduck_mdp.randomize_bam_friction,
@@ -619,10 +677,13 @@ def _make_jump_base(
     cfg.scene.terrain.terrain_generator = None
 
     # ── 课程 ──────────────────────────────────────────────────────────────────
+    # 地形课程与速度命令课程跟本任务无关（平地、零命令），删除。
     if "terrain_levels" in cfg.curriculum:
         del cfg.curriculum["terrain_levels"]
     del cfg.curriculum["command_vel"]
 
+    # CoM 随机化范围爬坡：先在 ±3 mm 学会跳，再逐步放大到真实装配偏差
+    # ±15 mm（AGENTS.md：先固化当前切片再硬化）。
     if ENABLE_COM_RANDOMIZATION:
         cfg.curriculum["com_range"] = CurriculumTermCfg(
             func=microduck_mdp.com_range_curriculum,
@@ -637,6 +698,7 @@ def _make_jump_base(
             },
         )
 
+    # 头部 CoM 同样爬坡，上限 ±10 mm。
     if ENABLE_HEAD_COM_RANDOMIZATION:
         cfg.curriculum["head_com_range"] = CurriculumTermCfg(
             func=microduck_mdp.com_range_curriculum,
@@ -676,6 +738,9 @@ def _make_jump_base(
 
     # 保护爬坡：stage-0 比例 → 满权重（velstand 模式）。
     # gentle_landing（自带负号的函数）用正数段，mjlab 风格成本用负数段。
+    # 保护栈爬坡：step 0 的 stage-0 比例（梯度活着）→ PROTECT_FULL_STEP
+    # 满权重。⚠️ 正负号跟着函数的符号约定走：gentle_landing 正数段，
+    # 其余负数段。
     cfg.curriculum["gentle_landing_weight"] = CurriculumTermCfg(
         func=microduck_mdp.reward_weight,
         params={
@@ -686,6 +751,7 @@ def _make_jump_base(
             ],
         },
     )
+    # 四个冲击/堵转项的保护爬坡（负数段）。
     for _name, _full in [
         ("head_impact", HEAD_IMPACT_WEIGHT),
         ("trunk_impact", TRUNK_IMPACT_WEIGHT),
@@ -749,6 +815,8 @@ def make_microduck_frog_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg
         apex_ceiling=JUMP_APEX_CEILING,
     )
 
+    # 主判别项：每次合格触地付"该次飞行前向弧长 / 8 cm"，封顶归一。
+    # 实现：mdp.jump_distance_bonus（multi 模式下每一跳单独计分）。
     cfg.rewards["jump_distance"] = RewardTermCfg(
         func=microduck_mdp.jump_distance_bonus,
         weight=8.0,
@@ -756,7 +824,9 @@ def make_microduck_frog_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg
     )
 
     # 直线性 —— 向前跳，不斜不绕。连续蛙跳的 run-4 校准：连跳天然走弧线
-    # 且每一跳都是剧烈动作，所以漂移税减半、容差放宽。
+    # 且每一跳都是剧烈动作，所以漂移税减半（−0.2）、容差放宽（yaw 0.8
+    # rad / 侧移 5 cm）。实现：mdp.jump_yaw_drift_penalty /
+    # jump_lateral_drift_penalty（超出容差部分的平方）。
     cfg.rewards["jump_yaw_drift"] = RewardTermCfg(
         func=microduck_mdp.jump_yaw_drift_penalty,
         weight=-0.2,
@@ -775,14 +845,14 @@ def make_microduck_long_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg
     """Mjlab-LongJump-Flat-MicroDuck —— 单次立定跳远，落地站稳。
 
     单跳模式（``multi_flight=False``）：每回合只有第一次合格触地支付封顶
-    前向弧长，年金付率锁定在那次跳上，落地窗口永不关闭 —— "跳一次好的、
+    前向弧长，得分比例锁定在那次跳上，落地窗口永不关闭 —— "跳一次好的、
     落地、站到超时"按设计就是最优（run-4 之前的经济学，只对连续任务是
     错的）。距离权重保持 8.0：run-1-3 时代用这套付款形状训到了 7.6 cm 的
     中位弧长。
 
     漂移容差回到单跳标定（yaw 0.5 rad —— run-2 实测的 13.5° 中位 /
     20.8° p90 飞行偏航 —— 侧移 3 cm）：run-4 的放宽是给"连跳"的让步，
-    本任务不连跳。不加前向漂移税：向前正是它拿钱的方向。
+    本任务不连跳。不加前向漂移惩罚：向前正是它挣分的方向。
     """
     cfg = _make_jump_base(
         play=play,
@@ -793,11 +863,14 @@ def make_microduck_long_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg
         apex_ceiling=JUMP_APEX_CEILING,
     )
 
+    # 主判别项：与 FrogJump 同一函数（mdp.jump_distance_bonus），但本任务
+    # 是 single 模式 —— 状态机只在回合第一次过门触地计分并锁定。
     cfg.rewards["jump_distance"] = RewardTermCfg(
         func=microduck_mdp.jump_distance_bonus,
         weight=8.0,
         params={"target_x": JUMP_TARGET_X},
     )
+    # 单跳标定的漂移容差（run-2 实测的飞行偏航中位 13.5°/p90 20.8°）。
     cfg.rewards["jump_yaw_drift"] = RewardTermCfg(
         func=microduck_mdp.jump_yaw_drift_penalty,
         weight=-0.2,
@@ -817,8 +890,8 @@ def make_microduck_jump_high_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg
 
     单跳模式。判别项是 jump_height_bonus：合格飞行支付自己的 apex 增量
     （躯干 z 峰值 − 起跳 z）封顶 JUMP_TARGET_Z × 垂直度（以起落点水平位移
-    为自变量的硬高斯门，mdp.JUMP_VERT_TOL_FINAL_M 为课程终值）—— 落地年金
-    的付率基准换成同一个带门增量（``gain_ref``）。
+    为自变量的硬高斯门，mdp.JUMP_VERT_TOL_FINAL_M 为课程终值）—— 落地奖励
+    窗口的得分基准换成同一个带门增量（``gain_ref``）。
 
     任务定义（用户，2026-10-10）：垂直向上跳 —— 原地起跳、原地落下、
     高度即得分。第一版只付裸 rise，策略交出了 6 cm 的斜跳（实测 85.7%
@@ -849,7 +922,7 @@ def make_microduck_jump_high_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg
     )
 
     # 判别项 8.0 时被 dt 缩放稀释成噪声（满目标付款 = 8.0 × 0.02 = 0.16
-    # 回合和 vs ~7.0 的年金）：20.0 时满目标跳在年金梯度之上多出看得见的
+    # 回合和 vs ~7.0 的落地奖励）：20.0 时满目标跳在落地奖励梯度之上多出看得见的
     # 0.4。×_jump_last_vert 的垂直度门在函数内部。
     cfg.rewards["jump_height"] = RewardTermCfg(
         func=microduck_mdp.jump_height_bonus,
@@ -894,7 +967,7 @@ def make_microduck_jump_high_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg
     # 内部运行，否则会把这个 (step, tol) 阶段表钉在末档 2 cm 上 —— 在
     # 恰恰需要宽门的那些 run 上复活零梯度悬崖。
     cfg.curriculum["jump_vertical_tolerance"] = CurriculumTermCfg(
-        func=microduck_mdp.jump_vertical_tolerance_curriculum,
+        func=microduck_mdp.jump_vertical_tolerance_curriculum,  # 实现：mdp.py
         params={
             "tol_stages": [
                 {"step": 0,          "tol": 0.10},
@@ -949,7 +1022,7 @@ def _jump_runner_cfg(
             symmetry_cfg=SYMMETRY_CFG if ENABLE_SYMMETRY else None,
         ),
         wandb_project="mjlab_microduck",
-        experiment_name=experiment_name,
+        experiment_name=experiment_name,  # 日志目录名：logs/rsl_rl/<experiment_name>/
         run_name=run_name,
         save_interval=250,
         num_steps_per_env=24,
